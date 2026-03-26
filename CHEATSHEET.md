@@ -27,7 +27,7 @@ Ensure the XIAO ESP32C3 is connected by USB and the correct serial port is avail
 ## Clean + build + upload (one shot)
 
 ```bash
-pio run -t clean && pio run -t upload
+pio run -t clean && pio run -t upload && pio device monitor
 ```
 
 ## Serial monitor (115200 baud)
