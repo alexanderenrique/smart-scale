@@ -7,6 +7,9 @@
 
 #define LV_COLOR_DEPTH 16
 
+/* Byte swap for RGB565; Monitor-Project uses 1 — tune with TFT_BGR if hues look wrong */
+#define LV_COLOR_16_SWAP 1
+
 #define LV_MEM_CUSTOM 0
 #define LV_MEM_SIZE (32U * 1024U)
 

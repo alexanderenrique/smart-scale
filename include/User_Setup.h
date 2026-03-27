@@ -8,15 +8,21 @@
 #define TFT_WIDTH 240
 #define TFT_HEIGHT 320
 
-// XIAO ESP32C3 explicit SPI pin mapping.
-#define TFT_MOSI 7
-#define TFT_MISO 6
-#define TFT_SCLK 8
+// Panel sends BGR order; without this, red/blue (or green/blue) look swapped — same approach as Monitor-Project.
+#define TFT_RGB_ORDER TFT_BGR
+
+// DMA for faster SPI block writes (optional parity with Monitor-Project).
+#define ESP32_DMA_CHANNEL 1
+
+// ESP32 DevKit: explicit SPI (MOSI/SCLK). Set TFT_MISO to your SDO/MISO wire (required for XPT2046).
+#define TFT_MOSI 26
+#define TFT_MISO 19
+#define TFT_SCLK 25
 
 // Display control pins.
-#define TFT_CS 4
-#define TFT_DC 5
-#define TFT_RST 21
+#define TFT_CS 13
+#define TFT_DC 27
+#define TFT_RST 14
 
 // Touch controller pins (XPT2046).
 #define TOUCH_CS 20

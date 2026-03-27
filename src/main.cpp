@@ -16,8 +16,9 @@ static lv_obj_t* g_weight_label = nullptr;
 static uint32_t g_last_lv_tick_ms = 0;
 static uint32_t g_last_ui_update_ms = 0;
 
-static constexpr uint16_t kScreenWidth = 240;
-static constexpr uint16_t kScreenHeight = 320;
+// Must match tft.setRotation(): rotation 1 = landscape 320x240 on 240x320 panels.
+static constexpr uint16_t kScreenWidth = 320;
+static constexpr uint16_t kScreenHeight = 240;
 static constexpr uint16_t kLvglDrawRows = 20;
 
 static lv_color_t g_lv_buf1[kScreenWidth * kLvglDrawRows];
