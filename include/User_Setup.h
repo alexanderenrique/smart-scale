@@ -14,9 +14,9 @@
 // DMA for faster SPI block writes (optional parity with Monitor-Project).
 #define ESP32_DMA_CHANNEL 1
 
-// ESP32 DevKit: explicit SPI (MOSI/SCLK). Set TFT_MISO to your SDO/MISO wire (required for XPT2046).
+// ESP32 DevKit: explicit SPI lines (shared by TFT + XPT2046 touch).
 #define TFT_MOSI 26
-#define TFT_MISO 19
+#define TFT_MISO 32
 #define TFT_SCLK 25
 
 // Display control pins.
@@ -25,7 +25,8 @@
 #define TFT_RST 14
 
 // Touch controller pins (XPT2046).
-#define TOUCH_CS 20
+#define TOUCH_CS 33
+// T_IRQ not used.
 #define TOUCH_IRQ -1
 
 // Fonts and optional rendering support.

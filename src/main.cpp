@@ -2,6 +2,11 @@
 #include <HX711.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
+#include <esp_system.h>
+#include "rom/ets_sys.h"
+
+#include <cmath>
+#include <cstring>
 
 #include "hardware.h"
 #include "lv_conf.h"
@@ -9,20 +14,110 @@
 HX711 scale;
 TFT_eSPI tft = TFT_eSPI();
 
-int32_t g_baseline;
-int32_t g_counts_at_cal;
+int32_t g_baseline = 0;
+int32_t g_counts_at_cal = COUNTS_AT_CAL;
 
-static lv_obj_t* g_weight_label = nullptr;
+static lv_obj_t* g_status_label = nullptr;
 static uint32_t g_last_lv_tick_ms = 0;
 static uint32_t g_last_ui_update_ms = 0;
+static bool g_touch_was_down = false;
+static uint32_t g_last_touch_log_ms = 0;
+
+static void log_touch_position(bool touched, uint16_t x, uint16_t y) {
+  const uint32_t now = millis();
+  if (touched) {
+    if (!g_touch_was_down || (now - g_last_touch_log_ms >= 200)) {
+      Serial.print(F("touch:x="));
+      Serial.print(x);
+      Serial.print(F(",y="));
+      Serial.println(y);
+      g_last_touch_log_ms = now;
+    }
+    g_touch_was_down = true;
+  } else if (g_touch_was_down) {
+    Serial.println(F("touch:release"));
+    g_touch_was_down = false;
+  }
+}
 
 // Must match tft.setRotation(): rotation 1 = landscape 320x240 on 240x320 panels.
 static constexpr uint16_t kScreenWidth = 320;
 static constexpr uint16_t kScreenHeight = 240;
 static constexpr uint16_t kLvglDrawRows = 20;
+static constexpr uint32_t kLvColorBytesPerPixel = 2;  // RGB565
 
-static lv_color_t g_lv_buf1[kScreenWidth * kLvglDrawRows];
-static lv_color_t g_lv_buf2[kScreenWidth * kLvglDrawRows];
+// LVGL v9 checks draw buffer alignment in lv_display_set_buffers().
+// Keep explicit byte buffers with LV_ATTRIBUTE_MEM_ALIGN to satisfy alignment asserts.
+static LV_ATTRIBUTE_MEM_ALIGN uint8_t g_lv_buf1[kScreenWidth * kLvglDrawRows * kLvColorBytesPerPixel];
+static LV_ATTRIBUTE_MEM_ALIGN uint8_t g_lv_buf2[kScreenWidth * kLvglDrawRows * kLvColorBytesPerPixel];
+#if LVGL_VERSION_MAJOR >= 9
+static lv_draw_buf_t g_draw_buf1_v9;
+static lv_draw_buf_t g_draw_buf2_v9;
+#endif
+
+enum class SystemState : uint8_t {
+  IDLE,
+  LOAD_DETECTED,
+  HEATING_MONITORING,
+  EVAPORATING,
+  WARNING,
+  SHUTDOWN,
+  PAUSED_BY_USER,
+  FAULT
+};
+
+enum class ShutdownReason : uint8_t {
+  None,
+  DryDetected,
+  RapidMassLoss,
+  VesselRemovedHot,
+  SensorFault,
+  WarningExpired,
+  PauseExpired
+};
+
+struct SensorSnapshot {
+  float mass_g = 0.0f;
+  float mass_rate_g_per_min = 0.0f;
+  float plate_temp_C = 0.0f;
+  float temp_rate_C_per_min = 0.0f;
+  bool heater_current_on = false;
+  bool valid = true;
+  uint32_t time_ms = 0;
+};
+
+struct DerivedSignals {
+  bool mass_present = false;
+  bool heating_active = false;
+  bool mass_stable = false;
+  bool rapid_mass_drop = false;
+  bool drying_detected = false;
+  bool temp_rising = false;
+  bool near_zero_rate_while_hot = false;
+  bool dry_condition = false;
+  bool load_removed_while_hot = false;
+  bool warning_timer_expired = false;
+  bool sensor_fault = false;
+};
+
+static SystemState g_state = SystemState::IDLE;
+static ShutdownReason g_shutdown_reason = ShutdownReason::None;
+static uint32_t g_state_enter_ms = 0;
+static uint32_t g_load_stable_start_ms = 0;
+static uint32_t g_idle_stable_start_ms = 0;
+static uint32_t g_warning_start_ms = 0;
+static uint32_t g_pause_start_ms = 0;
+static float g_baseline_mass_g = 0.0f;
+
+static SensorSnapshot g_sensor;
+static DerivedSignals g_derived;
+
+static bool g_serial_ack = false;
+static bool g_relay_enabled = false;
+static float g_prev_mass_g = 0.0f;
+static float g_prev_temp_C = 0.0f;
+static uint32_t g_prev_sample_ms = 0;
+static bool g_first_sample = true;
 
 #if LVGL_VERSION_MAJOR >= 9
 static void lvgl_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
@@ -39,6 +134,7 @@ static void lvgl_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
   uint16_t x = 0;
   uint16_t y = 0;
   const bool touched = tft.getTouch(&x, &y, 600);
+  log_touch_position(touched, x, y);
   data->state = touched ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
   if (touched) {
     data->point.x = x;
@@ -65,6 +161,7 @@ static void lvgl_touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   uint16_t x = 0;
   uint16_t y = 0;
   const bool touched = tft.getTouch(&x, &y, 600);
+  log_touch_position(touched, x, y);
   data->state = touched ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
   if (touched) {
     data->point.x = x;
@@ -73,6 +170,57 @@ static void lvgl_touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   (void)indev;
 }
 #endif
+
+static const char* state_name(SystemState s) {
+  switch (s) {
+    case SystemState::IDLE: return "IDLE";
+    case SystemState::LOAD_DETECTED: return "LOAD_DETECTED";
+    case SystemState::HEATING_MONITORING: return "HEATING_MONITORING";
+    case SystemState::EVAPORATING: return "EVAPORATING";
+    case SystemState::WARNING: return "WARNING";
+    case SystemState::SHUTDOWN: return "SHUTDOWN";
+    case SystemState::PAUSED_BY_USER: return "PAUSED_BY_USER";
+    case SystemState::FAULT: return "FAULT";
+  }
+  return "UNKNOWN";
+}
+
+static const char* reason_name(ShutdownReason r) {
+  switch (r) {
+    case ShutdownReason::None: return "none";
+    case ShutdownReason::DryDetected: return "dry_detected";
+    case ShutdownReason::RapidMassLoss: return "rapid_mass_loss";
+    case ShutdownReason::VesselRemovedHot: return "vessel_removed_hot";
+    case ShutdownReason::SensorFault: return "sensor_fault";
+    case ShutdownReason::WarningExpired: return "warning_expired";
+    case ShutdownReason::PauseExpired: return "pause_expired";
+  }
+  return "unknown";
+}
+
+static void set_relay_enabled(bool enabled) {
+  g_relay_enabled = enabled;
+  digitalWrite(PIN_HEATER_RELAY, enabled ? RELAY_ACTIVE_LEVEL : (RELAY_ACTIVE_LEVEL == HIGH ? LOW : HIGH));
+  Serial.print(F("relay="));
+  Serial.println(enabled ? F("ON") : F("OFF"));
+}
+
+static void log_event(const char* tag) {
+  Serial.print(F("event="));
+  Serial.print(tag);
+  Serial.print(F(",t_ms="));
+  Serial.print(g_sensor.time_ms);
+  Serial.print(F(",state="));
+  Serial.print(state_name(g_state));
+  Serial.print(F(",mass_g="));
+  Serial.print(g_sensor.mass_g, 2);
+  Serial.print(F(",mass_rate_gpm="));
+  Serial.print(g_sensor.mass_rate_g_per_min, 3);
+  Serial.print(F(",temp_C="));
+  Serial.print(g_sensor.plate_temp_C, 2);
+  Serial.print(F(",shutdown_reason="));
+  Serial.println(reason_name(g_shutdown_reason));
+}
 
 static void lvgl_tick() {
   const uint32_t now = millis();
@@ -88,56 +236,124 @@ static void lvgl_tick() {
 }
 
 static void init_display_ui() {
+  Serial.println(F("[BOOT][UI] enter init_display_ui"));
+  Serial.println(F("[BOOT][UI] tft.init start"));
   tft.init();
+  Serial.println(F("[BOOT][UI] tft.init done"));
+  Serial.println(F("[BOOT][UI] tft.setRotation start"));
   tft.setRotation(1);
+  Serial.println(F("[BOOT][UI] tft.setRotation done"));
+  Serial.println(F("[BOOT][UI] tft.fillScreen start"));
   tft.fillScreen(TFT_BLACK);
+  Serial.println(F("[BOOT][UI] tft.fillScreen done"));
 
+  Serial.println(F("[BOOT][UI] lv_init start"));
   lv_init();
+  Serial.println(F("[BOOT][UI] lv_init done"));
   g_last_lv_tick_ms = millis();
+  Serial.println(F("[BOOT][UI] tick baseline set"));
 
 #if LVGL_VERSION_MAJOR >= 9
+  Serial.println(F("[BOOT][UI] lv_display_create start"));
   lv_display_t* display = lv_display_create(kScreenWidth, kScreenHeight);
+  Serial.println(F("[BOOT][UI] lv_display_create done"));
+  if (display == nullptr) {
+    Serial.println(F("[ERROR][UI] lv_display_create returned nullptr"));
+    return;
+  }
+  Serial.println(F("[BOOT][UI] lv_display_set_color_format start"));
+  lv_display_set_color_format(display, LV_COLOR_FORMAT_RGB565);
+  Serial.println(F("[BOOT][UI] lv_display_set_color_format done"));
+  Serial.println(F("[BOOT][UI] lv_display_set_flush_cb start"));
   lv_display_set_flush_cb(display, lvgl_flush_cb);
-  lv_display_set_buffers(
-      display, g_lv_buf1, g_lv_buf2, sizeof(g_lv_buf1), LV_DISPLAY_RENDER_MODE_PARTIAL);
+  Serial.println(F("[BOOT][UI] lv_display_set_flush_cb done"));
+  Serial.println(F("[BOOT][UI] lv_draw_buf_init #1 start"));
+  lv_result_t buf1_ok = lv_draw_buf_init(
+      &g_draw_buf1_v9,
+      kScreenWidth,
+      kLvglDrawRows,
+      LV_COLOR_FORMAT_RGB565,
+      0,
+      g_lv_buf1,
+      sizeof(g_lv_buf1));
+  Serial.print(F("[BOOT][UI] lv_draw_buf_init #1 result="));
+  Serial.println(static_cast<int>(buf1_ok));
+  if (buf1_ok != LV_RESULT_OK) {
+    Serial.println(F("[ERROR][UI] draw buffer #1 init failed"));
+    return;
+  }
 
+  Serial.println(F("[BOOT][UI] lv_draw_buf_init #2 start"));
+  lv_result_t buf2_ok = lv_draw_buf_init(
+      &g_draw_buf2_v9,
+      kScreenWidth,
+      kLvglDrawRows,
+      LV_COLOR_FORMAT_RGB565,
+      0,
+      g_lv_buf2,
+      sizeof(g_lv_buf2));
+  Serial.print(F("[BOOT][UI] lv_draw_buf_init #2 result="));
+  Serial.println(static_cast<int>(buf2_ok));
+  if (buf2_ok != LV_RESULT_OK) {
+    Serial.println(F("[ERROR][UI] draw buffer #2 init failed"));
+    return;
+  }
+
+  Serial.println(F("[BOOT][UI] lv_display_set_draw_buffers start"));
+  lv_display_set_draw_buffers(display, &g_draw_buf1_v9, &g_draw_buf2_v9);
+  Serial.println(F("[BOOT][UI] lv_display_set_draw_buffers done"));
+  Serial.println(F("[BOOT][UI] lv_display_set_render_mode start"));
+  lv_display_set_render_mode(display, LV_DISPLAY_RENDER_MODE_PARTIAL);
+  Serial.println(F("[BOOT][UI] lv_display_set_render_mode done"));
+
+  Serial.println(F("[BOOT][UI] lv_indev_create start"));
   lv_indev_t* indev = lv_indev_create();
+  Serial.println(F("[BOOT][UI] lv_indev_create done"));
+  Serial.println(F("[BOOT][UI] lv_indev_set_type start"));
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  Serial.println(F("[BOOT][UI] lv_indev_set_type done"));
+  Serial.println(F("[BOOT][UI] lv_indev_set_read_cb start"));
   lv_indev_set_read_cb(indev, lvgl_touch_read_cb);
+  Serial.println(F("[BOOT][UI] lv_indev_set_read_cb done"));
 #else
+  Serial.println(F("[BOOT][UI] lv_disp_draw_buf_init start"));
   lv_disp_draw_buf_init(
-      &g_draw_buf, g_lv_buf1, g_lv_buf2, static_cast<uint32_t>(kScreenWidth) * kLvglDrawRows);
+      &g_draw_buf,
+      reinterpret_cast<lv_color_t*>(g_lv_buf1),
+      reinterpret_cast<lv_color_t*>(g_lv_buf2),
+      static_cast<uint32_t>(kScreenWidth) * kLvglDrawRows);
+  Serial.println(F("[BOOT][UI] lv_disp_draw_buf_init done"));
+  Serial.println(F("[BOOT][UI] lv_disp_drv_init start"));
   lv_disp_drv_init(&g_disp_drv);
+  Serial.println(F("[BOOT][UI] lv_disp_drv_init done"));
   g_disp_drv.hor_res = kScreenWidth;
   g_disp_drv.ver_res = kScreenHeight;
   g_disp_drv.flush_cb = lvgl_flush_cb;
   g_disp_drv.draw_buf = &g_draw_buf;
+  Serial.println(F("[BOOT][UI] lv_disp_drv_register start"));
   lv_disp_drv_register(&g_disp_drv);
+  Serial.println(F("[BOOT][UI] lv_disp_drv_register done"));
 
+  Serial.println(F("[BOOT][UI] lv_indev_drv_init start"));
   lv_indev_drv_init(&g_indev_drv);
+  Serial.println(F("[BOOT][UI] lv_indev_drv_init done"));
   g_indev_drv.type = LV_INDEV_TYPE_POINTER;
   g_indev_drv.read_cb = lvgl_touch_read_cb;
+  Serial.println(F("[BOOT][UI] lv_indev_drv_register start"));
   lv_indev_drv_register(&g_indev_drv);
+  Serial.println(F("[BOOT][UI] lv_indev_drv_register done"));
 #endif
 
-  g_weight_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(g_weight_label, "Scale booting...");
-  lv_obj_align(g_weight_label, LV_ALIGN_CENTER, 0, 0);
+  Serial.println(F("[BOOT][UI] screen styling start"));
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x001122), 0);
+  g_status_label = lv_label_create(lv_scr_act());
+  lv_label_set_long_mode(g_status_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(g_status_label, kScreenWidth - 20);
+  lv_obj_align(g_status_label, LV_ALIGN_TOP_LEFT, 10, 8);
+  lv_label_set_text(g_status_label, "FSM booting...");
+  Serial.println(F("[BOOT][UI] first lv_timer_handler start"));
   lv_timer_handler();
-}
-
-static void update_weight_ui(long raw, int32_t delta, float grams) {
-  if (g_weight_label == nullptr) {
-    return;
-  }
-  if (millis() - g_last_ui_update_ms < 200) {
-    return;
-  }
-  g_last_ui_update_ms = millis();
-
-  char text[96];
-  snprintf(text, sizeof(text), "Raw: %ld\nDelta: %ld\nWeight: %.2f g", raw, static_cast<long>(delta), grams);
-  lv_label_set_text(g_weight_label, text);
+  Serial.println(F("[BOOT][UI] init_display_ui complete"));
 }
 
 static void wait_for_enter(const __FlashStringHelper* prompt) {
@@ -163,21 +379,9 @@ static void collect_baseline() {
   Serial.println(F("Averaging empty baseline — do not touch the scale..."));
   int64_t sum = 0;
   uint32_t n = 0;
-  const unsigned long t0 = millis();
-  const unsigned long deadline = t0 + static_cast<unsigned long>(BASELINE_SECONDS) * 1000UL;
-  unsigned long next_hb = t0;
+  const uint32_t t0 = millis();
+  const uint32_t deadline = t0 + static_cast<uint32_t>(BASELINE_SECONDS) * 1000UL;
   while (millis() < deadline) {
-    const unsigned long now = millis();
-    if (now >= next_hb) {
-      next_hb = now + HEARTBEAT_INTERVAL_MS;
-      const unsigned sec = (now - t0) / 1000UL;
-      Serial.print(F("[baseline "));
-      Serial.print(sec);
-      Serial.print(F("s samples="));
-      Serial.print(n);
-      Serial.println(F("]"));
-      Serial.flush();
-    }
     if (scale.is_ready()) {
       sum += scale.read();
       ++n;
@@ -185,7 +389,7 @@ static void collect_baseline() {
     delay(SAMPLE_DELAY_MS);
   }
   if (n == 0) {
-    Serial.println(F("ERROR: no HX711 samples during baseline window."));
+    Serial.println(F("ERROR: no HX711 baseline samples."));
     while (true) {
       delay(500);
     }
@@ -193,28 +397,15 @@ static void collect_baseline() {
   g_baseline = static_cast<int32_t>(sum / static_cast<int64_t>(n));
   Serial.print(F("Baseline raw average: "));
   Serial.println(g_baseline);
-  Serial.flush();
 }
 
 static void collect_calibration_250g() {
-  Serial.println(F("Averaging with calibration weight — keep 250 g steady..."));
+  Serial.println(F("Averaging with 250 g calibration weight..."));
   int64_t sum = 0;
   uint32_t n = 0;
-  const unsigned long t0 = millis();
-  const unsigned long deadline = t0 + static_cast<unsigned long>(CALIBRATION_SECONDS) * 1000UL;
-  unsigned long next_hb = t0;
+  const uint32_t t0 = millis();
+  const uint32_t deadline = t0 + static_cast<uint32_t>(CALIBRATION_SECONDS) * 1000UL;
   while (millis() < deadline) {
-    const unsigned long now = millis();
-    if (now >= next_hb) {
-      next_hb = now + HEARTBEAT_INTERVAL_MS;
-      const unsigned sec = (now - t0) / 1000UL;
-      Serial.print(F("[cal "));
-      Serial.print(sec);
-      Serial.print(F("s samples="));
-      Serial.print(n);
-      Serial.println(F("]"));
-      Serial.flush();
-    }
     if (scale.is_ready()) {
       sum += scale.read();
       ++n;
@@ -222,79 +413,47 @@ static void collect_calibration_250g() {
     delay(SAMPLE_DELAY_MS);
   }
   if (n == 0) {
-    Serial.println(F("ERROR: no HX711 samples during calibration window."));
     g_counts_at_cal = COUNTS_AT_CAL;
-    Serial.print(F("Using fallback COUNTS_AT_CAL from firmware: "));
-    Serial.println(g_counts_at_cal);
+    Serial.println(F("No calibration samples; using COUNTS_AT_CAL fallback."));
     return;
   }
   const int32_t avg_raw = static_cast<int32_t>(sum / static_cast<int64_t>(n));
   const int32_t measured = avg_raw - g_baseline;
-  Serial.print(F("Calibration raw average: "));
-  Serial.println(avg_raw);
-  Serial.print(F("Measured delta (counts for "));
-  Serial.print(CAL_REFERENCE_G);
-  Serial.print(F(" g): "));
-  Serial.println(measured);
-
-  if (measured > 100) {
-    g_counts_at_cal = measured;
-    Serial.println(F("Calibration OK — using measured counts for this session."));
-  } else {
-    g_counts_at_cal = COUNTS_AT_CAL;
-    Serial.println(F("Calibration delta too small or wrong sign; using COUNTS_AT_CAL from hardware.h."));
-  }
-  Serial.print(F("Optional: set COUNTS_AT_CAL in hardware.h to "));
-  Serial.print(g_counts_at_cal);
-  Serial.println(F(" to persist."));
-  Serial.flush();
+  g_counts_at_cal = (measured > 100) ? measured : COUNTS_AT_CAL;
+  Serial.print(F("Calibration counts used: "));
+  Serial.println(g_counts_at_cal);
 }
 
-void setup() {
-  static_assert(COUNTS_AT_CAL > 0, "COUNTS_AT_CAL must be positive");
-
-  Serial.begin(SERIAL_BAUD);
-  delay(200);
-  Serial.println();
-  Serial.println(F("smart-scale: boot"));
-  Serial.flush();
-
-  init_display_ui();
-
-  scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
-  Serial.println(F("smart-scale: HX711 begin OK"));
-  Serial.flush();
-
-  wait_for_enter(
-      F(">>> Step 1 — Empty scale: remove all weight from the platform."));
-  collect_baseline();
-
-  wait_for_enter(F(">>> Step 2 — Place the 250 g calibration weight on the platform."));
-  g_counts_at_cal = COUNTS_AT_CAL;
-  collect_calibration_250g();
-
-  Serial.println(F("--- Running (2 Hz) — columns: raw delta_g grams ---"));
-  Serial.flush();
+static void process_serial_commands() {
+  static char line[40];
+  static size_t len = 0;
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r' || c == '\n') {
+      // Enter alone is treated as acknowledge/resume/reset.
+      if (len == 0) {
+        g_serial_ack = true;
+      } else {
+        line[len] = '\0';
+        if (strcmp(line, "ack") == 0 || strcmp(line, "resume") == 0) {
+          g_serial_ack = true;
+        } else if (strcmp(line, "status") == 0) {
+          log_event("status");
+        }
+      }
+      len = 0;
+    } else if (len < sizeof(line) - 1) {
+      line[len++] = c;
+    }
+  }
 }
 
-void loop() {
-  lvgl_tick();
-  lv_timer_handler();
-
-  static unsigned long last_hb = 0;
-  const unsigned long now = millis();
-  if (now - last_hb >= HEARTBEAT_INTERVAL_MS) {
-    last_hb = now;
-    Serial.print(F("[hb ms="));
-    Serial.print(now);
-    Serial.print(F(" ready="));
-    Serial.print(scale.is_ready() ? 1 : 0);
-    Serial.println(F("]"));
-    Serial.flush();
-  }
+static void updateSensors() {
+  g_sensor.time_ms = millis();
+  g_sensor.valid = true;
 
   if (!scale.is_ready()) {
-    delay(SAMPLE_DELAY_MS);
+    g_sensor.valid = false;
     return;
   }
 
@@ -302,17 +461,318 @@ void loop() {
   const int32_t delta = static_cast<int32_t>(raw - g_baseline);
   const int32_t divisor = (g_counts_at_cal > 0) ? g_counts_at_cal : 1;
   float grams = delta * (static_cast<float>(CAL_REFERENCE_G) / static_cast<float>(divisor));
-  if (grams < 0.f) {
-    grams = 0.f;
+  if (grams < 0.0f) {
+    grams = 0.0f;
+  }
+  g_sensor.mass_g = grams;
+
+  const float tempC = USE_DUMMY_TEMPERATURE ? DUMMY_TEMP_C : 25.0f;
+  g_sensor.plate_temp_C = tempC;
+
+  if (g_first_sample) {
+    g_prev_mass_g = g_sensor.mass_g;
+    g_prev_temp_C = g_sensor.plate_temp_C;
+    g_prev_sample_ms = g_sensor.time_ms;
+    g_sensor.mass_rate_g_per_min = 0.0f;
+    g_sensor.temp_rate_C_per_min = 0.0f;
+    g_first_sample = false;
+  } else {
+    const uint32_t dt_ms = g_sensor.time_ms - g_prev_sample_ms;
+    const float dt_min = static_cast<float>(dt_ms) / 60000.0f;
+    if (dt_min > 0.0001f) {
+      const float mass_rate_raw = (g_sensor.mass_g - g_prev_mass_g) / dt_min;
+      const float temp_rate_raw = (g_sensor.plate_temp_C - g_prev_temp_C) / dt_min;
+      g_sensor.mass_rate_g_per_min =
+          (MASS_RATE_EMA_ALPHA * mass_rate_raw) + ((1.0f - MASS_RATE_EMA_ALPHA) * g_sensor.mass_rate_g_per_min);
+      g_sensor.temp_rate_C_per_min =
+          (TEMP_RATE_EMA_ALPHA * temp_rate_raw) + ((1.0f - TEMP_RATE_EMA_ALPHA) * g_sensor.temp_rate_C_per_min);
+    }
+    g_prev_mass_g = g_sensor.mass_g;
+    g_prev_temp_C = g_sensor.plate_temp_C;
+    g_prev_sample_ms = g_sensor.time_ms;
   }
 
-  update_weight_ui(raw, delta, grams);
+  g_sensor.heater_current_on = g_relay_enabled;
 
-  Serial.print(raw);
-  Serial.print(' ');
-  Serial.print(delta);
-  Serial.print(' ');
-  Serial.println(grams, 2);
+  if (isnan(g_sensor.mass_g) || isnan(g_sensor.mass_rate_g_per_min) || isnan(g_sensor.plate_temp_C) ||
+      isnan(g_sensor.temp_rate_C_per_min)) {
+    g_sensor.valid = false;
+  }
+}
+
+static void computeDerivedSignals() {
+  g_derived.mass_present = g_sensor.mass_g > MASS_PRESENT_THRESHOLD_G;
+  g_derived.heating_active = g_sensor.plate_temp_C > TEMP_HEATING_THRESHOLD_C;
+  g_derived.mass_stable = fabsf(g_sensor.mass_rate_g_per_min) < STABLE_RATE_THRESHOLD_G_PER_MIN;
+  g_derived.rapid_mass_drop = g_sensor.mass_rate_g_per_min < RAPID_DROP_THRESHOLD_G_PER_MIN;
+  g_derived.drying_detected = g_sensor.mass_rate_g_per_min < DRYING_RATE_THRESHOLD_G_PER_MIN;
+  g_derived.temp_rising = g_sensor.temp_rate_C_per_min > TEMP_RISE_THRESHOLD_C_PER_MIN;
+  g_derived.near_zero_rate_while_hot =
+      g_derived.heating_active && (fabsf(g_sensor.mass_rate_g_per_min) < NEAR_ZERO_RATE_THRESHOLD_G_PER_MIN);
+
+  float ratio = 1.0f;
+  if (g_baseline_mass_g > 0.01f) {
+    ratio = g_sensor.mass_g / g_baseline_mass_g;
+  }
+  g_derived.dry_condition = ratio < DRY_SHUTDOWN_THRESHOLD;
+  g_derived.load_removed_while_hot = (!g_derived.mass_present) && g_derived.heating_active;
+  g_derived.warning_timer_expired =
+      (g_state == SystemState::WARNING) && (g_sensor.time_ms - g_warning_start_ms >= WARNING_COUNTDOWN_MS);
+  g_derived.sensor_fault = !g_sensor.valid;
+}
+
+static bool unified_shutdown_trigger(ShutdownReason* reason) {
+  if (g_derived.sensor_fault) {
+    *reason = ShutdownReason::SensorFault;
+    return true;
+  }
+  if (g_derived.rapid_mass_drop) {
+    *reason = ShutdownReason::RapidMassLoss;
+    return true;
+  }
+  if (g_derived.dry_condition) {
+    *reason = ShutdownReason::DryDetected;
+    return true;
+  }
+  if (g_derived.load_removed_while_hot) {
+    *reason = ShutdownReason::VesselRemovedHot;
+    return true;
+  }
+  if (g_derived.warning_timer_expired) {
+    *reason = ShutdownReason::WarningExpired;
+    return true;
+  }
+  return false;
+}
+
+static SystemState evaluateTransitions() {
+  ShutdownReason reason = ShutdownReason::None;
+  if (unified_shutdown_trigger(&reason)) {
+    g_shutdown_reason = reason;
+    return (reason == ShutdownReason::SensorFault) ? SystemState::FAULT : SystemState::SHUTDOWN;
+  }
+
+  switch (g_state) {
+    case SystemState::IDLE:
+      if (g_derived.mass_present) return SystemState::LOAD_DETECTED;
+      if (g_derived.heating_active || g_derived.temp_rising) return SystemState::HEATING_MONITORING;
+      break;
+
+    case SystemState::LOAD_DETECTED:
+      if (!g_derived.mass_present) return SystemState::IDLE;
+      if (g_derived.heating_active) return SystemState::HEATING_MONITORING;
+      if (g_derived.mass_stable) {
+        if (g_load_stable_start_ms == 0) {
+          g_load_stable_start_ms = g_sensor.time_ms;
+        } else if (g_sensor.time_ms - g_load_stable_start_ms >= STABLE_TIME_MS) {
+          g_baseline_mass_g = g_sensor.mass_g;
+        }
+      } else {
+        g_load_stable_start_ms = 0;
+      }
+      break;
+
+    case SystemState::HEATING_MONITORING:
+      if (!g_derived.mass_present) return SystemState::PAUSED_BY_USER;
+      if (g_derived.drying_detected) return SystemState::EVAPORATING;
+      if (!g_derived.heating_active) return SystemState::LOAD_DETECTED;
+      break;
+
+    case SystemState::EVAPORATING: {
+      const float ratio = (g_baseline_mass_g > 0.01f) ? (g_sensor.mass_g / g_baseline_mass_g) : 1.0f;
+      if (ratio < DRY_THRESHOLD || g_derived.near_zero_rate_while_hot) return SystemState::WARNING;
+      break;
+    }
+
+    case SystemState::WARNING:
+      if (g_serial_ack) return SystemState::HEATING_MONITORING;
+      if (g_sensor.mass_g > (g_baseline_mass_g + MASS_PRESENT_THRESHOLD_G * 0.5f)) return SystemState::HEATING_MONITORING;
+      break;
+
+    case SystemState::PAUSED_BY_USER:
+      if (g_derived.mass_present && (g_sensor.time_ms - g_pause_start_ms < PAUSE_GRACE_MS)) {
+        return SystemState::HEATING_MONITORING;
+      }
+      if (g_sensor.time_ms - g_pause_start_ms >= PAUSE_GRACE_MS) {
+        g_shutdown_reason = ShutdownReason::PauseExpired;
+        return SystemState::SHUTDOWN;
+      }
+      break;
+
+    case SystemState::SHUTDOWN:
+      if (g_serial_ack) {
+        if (g_derived.mass_present && g_derived.mass_stable) return SystemState::LOAD_DETECTED;
+        if (!g_derived.mass_present) return SystemState::IDLE;
+      }
+      break;
+
+    case SystemState::FAULT:
+      if (g_serial_ack && !g_derived.sensor_fault) return SystemState::IDLE;
+      break;
+  }
+
+  return g_state;
+}
+
+static void applyStateActions(SystemState new_state) {
+  if (new_state != g_state) {
+    g_state = new_state;
+    g_state_enter_ms = g_sensor.time_ms;
+    log_event("state_change");
+    if (g_state == SystemState::WARNING) {
+      g_warning_start_ms = g_sensor.time_ms;
+    }
+    if (g_state == SystemState::PAUSED_BY_USER) {
+      g_pause_start_ms = g_sensor.time_ms;
+    }
+    if (g_state == SystemState::LOAD_DETECTED) {
+      g_load_stable_start_ms = 0;
+    }
+  }
+
+  if (g_state == SystemState::IDLE && g_derived.mass_stable && !g_derived.heating_active) {
+    if (g_idle_stable_start_ms == 0) {
+      g_idle_stable_start_ms = g_sensor.time_ms;
+    } else if (g_sensor.time_ms - g_idle_stable_start_ms >= AUTO_TARE_DWELL_MS) {
+      g_baseline = g_baseline + static_cast<int32_t>(g_sensor.mass_g * (static_cast<float>(g_counts_at_cal) / CAL_REFERENCE_G));
+      g_idle_stable_start_ms = g_sensor.time_ms;
+      log_event("auto_tare");
+    }
+  } else {
+    g_idle_stable_start_ms = 0;
+  }
+
+  // Safety-first heater policy:
+  // Only energize relay in active heating phases.
+  const bool should_heat =
+      (g_state == SystemState::HEATING_MONITORING) ||
+      (g_state == SystemState::EVAPORATING) ||
+      (g_state == SystemState::WARNING);
+  if (g_relay_enabled != should_heat) {
+    set_relay_enabled(should_heat);
+  }
+}
+
+static lv_color_t state_color(SystemState s) {
+  switch (s) {
+    case SystemState::IDLE: return lv_color_hex(0x0E8E3A);
+    case SystemState::LOAD_DETECTED:
+    case SystemState::HEATING_MONITORING: return lv_color_hex(0x1B65D6);
+    case SystemState::EVAPORATING: return lv_color_hex(0xB28A00);
+    case SystemState::WARNING: return lv_color_hex(0xD67A00);
+    case SystemState::SHUTDOWN:
+    case SystemState::FAULT: return lv_color_hex(0xB11818);
+    case SystemState::PAUSED_BY_USER: return lv_color_hex(0x4444AA);
+  }
+  return lv_color_hex(0x222222);
+}
+
+static const char* status_line() {
+  switch (g_state) {
+    case SystemState::IDLE: return "Ready";
+    case SystemState::LOAD_DETECTED: return "Load detected, stabilizing";
+    case SystemState::HEATING_MONITORING: return "Monitoring heat and mass";
+    case SystemState::EVAPORATING: return "Evaporation detected";
+    case SystemState::WARNING: return "Liquid nearly gone - press Enter";
+    case SystemState::SHUTDOWN: return reason_name(g_shutdown_reason);
+    case SystemState::PAUSED_BY_USER: return "Load removed - waiting";
+    case SystemState::FAULT: return "Sensor fault - press Enter to reset";
+  }
+  return "";
+}
+
+static void updateUI() {
+  if (g_status_label == nullptr) return;
+  if (millis() - g_last_ui_update_ms < UI_UPDATE_MS) return;
+  g_last_ui_update_ms = millis();
+
+  lv_obj_set_style_bg_color(lv_scr_act(), state_color(g_state), 0);
+  lv_obj_set_style_text_color(g_status_label, lv_color_hex(0xFFFFFF), 0);
+
+  char text[320];
+  snprintf(
+      text,
+      sizeof(text),
+      "STATE: %s\nHeater: %s\n\nMass: %.2f g\nRate: %.3f g/min\nTemp: %.1f C\n\nStatus: %s",
+      state_name(g_state),
+      g_relay_enabled ? "ON" : "OFF",
+      g_sensor.mass_g,
+      g_sensor.mass_rate_g_per_min,
+      g_sensor.plate_temp_C,
+      status_line());
+  lv_label_set_text(g_status_label, text);
+}
+
+void setup() {
+  ets_printf("[EARLY] setup entered\n");
+  static_assert(COUNTS_AT_CAL > 0, "COUNTS_AT_CAL must be positive");
+
+  pinMode(PIN_HEATER_RELAY, OUTPUT);
+  // Keep heater OFF until state machine explicitly allows heating.
+  digitalWrite(PIN_HEATER_RELAY, (RELAY_ACTIVE_LEVEL == HIGH ? LOW : HIGH));
+  g_relay_enabled = false;
+  ets_printf("[EARLY] relay forced OFF\n");
+
+  Serial.begin(SERIAL_BAUD);
+  ets_printf("[EARLY] Serial.begin done\n");
+  delay(200);
+  Serial.println(F("[BOOT] smart-scale setup start"));
+  Serial.print(F("[BOOT] reset_reason="));
+  Serial.println(static_cast<uint32_t>(esp_reset_reason()));
+  Serial.print(F("[BOOT] SERIAL_BAUD="));
+  Serial.println(SERIAL_BAUD);
+
+  Serial.println(F("[BOOT] init_display_ui start"));
+  init_display_ui();
+  Serial.println(F("[BOOT] init_display_ui done"));
+
+  Serial.println(F("[BOOT] HX711 begin start"));
+  scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
+  Serial.println(F("HX711 begin OK"));
+  Serial.print(F("[BOOT] HX711 pins dt="));
+  Serial.print(PIN_HX711_DT);
+  Serial.print(F(", sck="));
+  Serial.println(PIN_HX711_SCK);
+
+  Serial.println(F("[BOOT] waiting for empty-scale Enter"));
+  wait_for_enter(F(">>> Step 1 - Empty scale: remove all weight."));
+  Serial.println(F("[BOOT] baseline collection start"));
+  collect_baseline();
+  Serial.println(F("[BOOT] baseline collection done"));
+
+  Serial.println(F("[BOOT] waiting for calibration Enter"));
+  wait_for_enter(F(">>> Step 2 - Place 250 g calibration weight."));
+  Serial.println(F("[BOOT] calibration collection start"));
+  collect_calibration_250g();
+  Serial.println(F("[BOOT] calibration collection done"));
+
+  g_state_enter_ms = millis();
+  log_event("boot_complete");
+  Serial.println(F("[BOOT] setup complete"));
+}
+
+void loop() {
+  lvgl_tick();
+  lv_timer_handler();
+
+  process_serial_commands();
+
+  updateSensors();
+  computeDerivedSignals();
+
+  const SystemState next = evaluateTransitions();
+  applyStateActions(next);
+  updateUI();
+
+  if (g_serial_ack) {
+    g_serial_ack = false;
+  }
+
+  static uint32_t last_hb = 0;
+  if (millis() - last_hb >= HEARTBEAT_INTERVAL_MS) {
+    last_hb = millis();
+    log_event("hb");
+  }
 
   delay(SAMPLE_DELAY_MS);
 }
