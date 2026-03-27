@@ -2,6 +2,9 @@
 #include <HX711.h>
 #include <TFT_eSPI.h>
 #include <lvgl.h>
+#include <Preferences.h>
+#include <nvs_flash.h>
+#include <esp_err.h>
 #include <esp_system.h>
 #include "rom/ets_sys.h"
 
@@ -22,6 +25,9 @@ static uint32_t g_last_lv_tick_ms = 0;
 static uint32_t g_last_ui_update_ms = 0;
 static bool g_touch_was_down = false;
 static uint32_t g_last_touch_log_ms = 0;
+
+static Preferences g_prefs;
+// Touchscreen calibration intentionally removed.
 
 static void log_touch_position(bool touched, uint16_t x, uint16_t y) {
   const uint32_t now = millis();
@@ -375,8 +381,59 @@ static void set_status_text(const char* text) {
   lv_timer_handler();
 }
 
+static void set_status_colors(lv_color_t bg, lv_color_t text) {
+  if (g_status_label == nullptr) return;
+  lv_obj_set_style_bg_color(lv_scr_act(), bg, 0);
+  lv_obj_set_style_text_color(g_status_label, text, 0);
+  lv_timer_handler();
+}
+
 static void collect_baseline();
 static void collect_calibration_250g();
+
+static bool load_scale_calibration(int32_t* baseline, int32_t* counts_at_cal) {
+  if (!g_prefs.begin("smart-scale", true)) {
+    Serial.println(F("[WARN][SCALE] prefs begin failed (ro)"));
+    return false;
+  }
+  const bool ok = g_prefs.getBool("scaleCalOk", false);
+  const int32_t b = g_prefs.getInt("baseline", 0);
+  const int32_t c = g_prefs.getInt("countsCal", 0);
+  g_prefs.end();
+  if (!ok || c <= 0) {
+    return false;
+  }
+  *baseline = b;
+  *counts_at_cal = c;
+  return true;
+}
+
+static void save_scale_calibration(int32_t baseline, int32_t counts_at_cal) {
+  if (!g_prefs.begin("smart-scale", false)) {
+    Serial.println(F("[WARN][SCALE] prefs begin failed (rw)"));
+    return;
+  }
+  g_prefs.putBool("scaleCalOk", true);
+  g_prefs.putInt("baseline", baseline);
+  g_prefs.putInt("countsCal", counts_at_cal);
+  g_prefs.end();
+}
+
+static void init_nvs_storage() {
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    (void)nvs_flash_erase();
+    err = nvs_flash_init();
+  }
+  if (err != ESP_OK) {
+    Serial.print(F("[WARN][NVS] init failed err="));
+    Serial.println(static_cast<int>(err));
+    Serial.print(F("[WARN][NVS] "));
+    Serial.println(esp_err_to_name(err));
+  } else {
+    Serial.println(F("[BOOT][NVS] init ok"));
+  }
+}
 
 static void wait_for_touch() {
   g_serial_ack = false;
@@ -391,9 +448,13 @@ static void wait_for_touch() {
 }
 
 static void run_first_boot_tare() {
-  wait_for_touch();
+  // No "touch to start" gate — run immediately on first boot.
+  set_status_colors(lv_color_hex(0xFFFFFF), lv_color_hex(0x000000));
+  set_status_text("First boot calibration\n\nRemove all weight\nStarting tare...");
+  lv_timer_handler();
   collect_baseline();
   collect_calibration_250g();
+  save_scale_calibration(g_baseline, g_counts_at_cal);
   set_status_text("Calibration complete");
 }
 
@@ -403,10 +464,21 @@ static void collect_baseline() {
   uint32_t n = 0;
   const uint32_t t0 = millis();
   const uint32_t deadline = t0 + static_cast<uint32_t>(BASELINE_SECONDS) * 1000UL;
+  uint32_t last_ui_second = 0;
   while (millis() < deadline) {
     if (scale.is_ready()) {
       sum += scale.read();
       ++n;
+    }
+    if (g_status_label != nullptr) {
+      const uint32_t elapsed_s = (millis() - t0) / 1000U;
+      if (elapsed_s != last_ui_second) {
+        last_ui_second = elapsed_s;
+        const uint32_t remaining = (BASELINE_SECONDS > elapsed_s) ? (BASELINE_SECONDS - elapsed_s) : 0;
+        char buf[128];
+        snprintf(buf, sizeof(buf), "First boot calibration\n\nRemove all weight\nTaring... %lus", static_cast<unsigned long>(remaining));
+        set_status_text(buf);
+      }
     }
     delay(SAMPLE_DELAY_MS);
   }
@@ -761,6 +833,10 @@ void setup() {
   init_display_ui();
   Serial.println(F("[BOOT] init_display_ui done"));
 
+  init_nvs_storage();
+
+  // Touchscreen calibration intentionally removed.
+
   Serial.println(F("[BOOT] HX711 begin start"));
   scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
   Serial.println(F("HX711 begin OK"));
@@ -769,7 +845,18 @@ void setup() {
   Serial.print(F(", sck="));
   Serial.println(PIN_HX711_SCK);
 
-  run_first_boot_tare();
+  {
+    int32_t saved_baseline = 0;
+    int32_t saved_counts = 0;
+    if (load_scale_calibration(&saved_baseline, &saved_counts)) {
+      g_baseline = saved_baseline;
+      g_counts_at_cal = saved_counts;
+      Serial.println(F("[BOOT][SCALE] calibration loaded"));
+    } else {
+      Serial.println(F("[BOOT][SCALE] calibration missing; running first-boot tare"));
+      run_first_boot_tare();
+    }
+  }
 
   g_state_enter_ms = millis();
   log_event("boot_complete");
