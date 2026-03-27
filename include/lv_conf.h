@@ -1,5 +1,10 @@
 #pragma once
 
+/* Tell LVGL this file was included successfully. */
+#ifndef LV_CONF_H
+#define LV_CONF_H
+#endif
+
 /*
  * Minimal LVGL project configuration for ESP32C3 + TFT_eSPI.
  * Keep this intentionally small for initial integration.
@@ -25,3 +30,7 @@
 
 #define LV_USE_THEME_DEFAULT 1
 #define LV_USE_LABEL 1
+
+/* Fonts */
+#define LV_FONT_MONTSERRAT_18 1
+#define LV_FONT_DEFAULT &lv_font_montserrat_18

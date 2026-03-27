@@ -77,6 +77,8 @@ enum class ShutdownReason : uint8_t {
 };
 
 struct SensorSnapshot {
+  int32_t raw_delta_counts = 0;
+  float raw_rate_counts_per_min = 0.0f;
   float mass_g = 0.0f;
   float mass_rate_g_per_min = 0.0f;
   float plate_temp_C = 0.0f;
@@ -107,13 +109,17 @@ static uint32_t g_load_stable_start_ms = 0;
 static uint32_t g_idle_stable_start_ms = 0;
 static uint32_t g_warning_start_ms = 0;
 static uint32_t g_pause_start_ms = 0;
-static float g_baseline_mass_g = 0.0f;
+static int32_t g_baseline_load_counts = 0;
 
 static SensorSnapshot g_sensor;
 static DerivedSignals g_derived;
 
 static bool g_serial_ack = false;
 static bool g_relay_enabled = false;
+static bool g_heating_info = USE_DUMMY_TEMPERATURE;
+static float g_smoothed_raw_delta_counts = 0.0f;
+static uint32_t g_last_sensor_publish_ms = 0;
+static int32_t g_prev_raw_delta_counts = 0;
 static float g_prev_mass_g = 0.0f;
 static float g_prev_temp_C = 0.0f;
 static uint32_t g_prev_sample_ms = 0;
@@ -135,6 +141,9 @@ static void lvgl_touch_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
   uint16_t y = 0;
   const bool touched = tft.getTouch(&x, &y, 600);
   log_touch_position(touched, x, y);
+  if (touched) {
+    g_serial_ack = true;
+  }
   data->state = touched ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
   if (touched) {
     data->point.x = x;
@@ -162,6 +171,9 @@ static void lvgl_touch_read_cb(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   uint16_t y = 0;
   const bool touched = tft.getTouch(&x, &y, 600);
   log_touch_position(touched, x, y);
+  if (touched) {
+    g_serial_ack = true;
+  }
   data->state = touched ? LV_INDEV_STATE_PR : LV_INDEV_STATE_REL;
   if (touched) {
     data->point.x = x;
@@ -212,10 +224,10 @@ static void log_event(const char* tag) {
   Serial.print(g_sensor.time_ms);
   Serial.print(F(",state="));
   Serial.print(state_name(g_state));
-  Serial.print(F(",mass_g="));
-  Serial.print(g_sensor.mass_g, 2);
-  Serial.print(F(",mass_rate_gpm="));
-  Serial.print(g_sensor.mass_rate_g_per_min, 3);
+  Serial.print(F(",raw_counts="));
+  Serial.print(g_sensor.raw_delta_counts);
+  Serial.print(F(",raw_rate_cpm="));
+  Serial.print(g_sensor.raw_rate_counts_per_min, 1);
   Serial.print(F(",temp_C="));
   Serial.print(g_sensor.plate_temp_C, 2);
   Serial.print(F(",shutdown_reason="));
@@ -350,29 +362,39 @@ static void init_display_ui() {
   lv_label_set_long_mode(g_status_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(g_status_label, kScreenWidth - 20);
   lv_obj_align(g_status_label, LV_ALIGN_TOP_LEFT, 10, 8);
+  lv_obj_set_style_text_font(g_status_label, LV_FONT_DEFAULT, 0);
   lv_label_set_text(g_status_label, "FSM booting...");
   Serial.println(F("[BOOT][UI] first lv_timer_handler start"));
   lv_timer_handler();
   Serial.println(F("[BOOT][UI] init_display_ui complete"));
 }
 
-static void wait_for_enter(const __FlashStringHelper* prompt) {
-  Serial.println(prompt);
-  Serial.println(F("Press Enter when ready."));
-  Serial.flush();
-  for (;;) {
-    if (Serial.available() > 0) {
-      const int c = Serial.read();
-      if (c == '\n' || c == '\r') {
-        delay(5);
-        while (Serial.available() > 0) {
-          Serial.read();
-        }
-        return;
-      }
-    }
+static void set_status_text(const char* text) {
+  if (g_status_label == nullptr) return;
+  lv_label_set_text(g_status_label, text);
+  lv_timer_handler();
+}
+
+static void collect_baseline();
+static void collect_calibration_250g();
+
+static void wait_for_touch() {
+  g_serial_ack = false;
+  set_status_text("First boot calibration\n\n1) Remove all weight\n2) Touch screen to start tare");
+  while (!g_serial_ack) {
+    lvgl_tick();
+    lv_timer_handler();
     delay(10);
   }
+  g_serial_ack = false;
+  set_status_text("Taring... do not touch the scale");
+}
+
+static void run_first_boot_tare() {
+  wait_for_touch();
+  collect_baseline();
+  collect_calibration_250g();
+  set_status_text("Calibration complete");
 }
 
 static void collect_baseline() {
@@ -400,27 +422,8 @@ static void collect_baseline() {
 }
 
 static void collect_calibration_250g() {
-  Serial.println(F("Averaging with 250 g calibration weight..."));
-  int64_t sum = 0;
-  uint32_t n = 0;
-  const uint32_t t0 = millis();
-  const uint32_t deadline = t0 + static_cast<uint32_t>(CALIBRATION_SECONDS) * 1000UL;
-  while (millis() < deadline) {
-    if (scale.is_ready()) {
-      sum += scale.read();
-      ++n;
-    }
-    delay(SAMPLE_DELAY_MS);
-  }
-  if (n == 0) {
-    g_counts_at_cal = COUNTS_AT_CAL;
-    Serial.println(F("No calibration samples; using COUNTS_AT_CAL fallback."));
-    return;
-  }
-  const int32_t avg_raw = static_cast<int32_t>(sum / static_cast<int64_t>(n));
-  const int32_t measured = avg_raw - g_baseline;
-  g_counts_at_cal = (measured > 100) ? measured : COUNTS_AT_CAL;
-  Serial.print(F("Calibration counts used: "));
+  g_counts_at_cal = COUNTS_AT_CAL;
+  Serial.print(F("Calibration step disabled; using COUNTS_AT_CAL="));
   Serial.println(g_counts_at_cal);
 }
 
@@ -439,6 +442,12 @@ static void process_serial_commands() {
           g_serial_ack = true;
         } else if (strcmp(line, "status") == 0) {
           log_event("status");
+        } else if (strcmp(line, "heating_on") == 0 || strcmp(line, "heat_on") == 0) {
+          g_heating_info = true;
+          Serial.println(F("heating_info=ON"));
+        } else if (strcmp(line, "heating_off") == 0 || strcmp(line, "heat_off") == 0) {
+          g_heating_info = false;
+          Serial.println(F("heating_info=OFF"));
         }
       }
       len = 0;
@@ -459,37 +468,63 @@ static void updateSensors() {
 
   const long raw = scale.read();
   const int32_t delta = static_cast<int32_t>(raw - g_baseline);
-  const int32_t divisor = (g_counts_at_cal > 0) ? g_counts_at_cal : 1;
-  float grams = delta * (static_cast<float>(CAL_REFERENCE_G) / static_cast<float>(divisor));
-  if (grams < 0.0f) {
-    grams = 0.0f;
-  }
-  g_sensor.mass_g = grams;
+  g_smoothed_raw_delta_counts =
+      (g_first_sample ? static_cast<float>(delta)
+                      : (RAW_COUNTS_EMA_ALPHA * static_cast<float>(delta)) +
+                            ((1.0f - RAW_COUNTS_EMA_ALPHA) * g_smoothed_raw_delta_counts));
 
   const float tempC = USE_DUMMY_TEMPERATURE ? DUMMY_TEMP_C : 25.0f;
   g_sensor.plate_temp_C = tempC;
 
   if (g_first_sample) {
+    g_sensor.raw_delta_counts = static_cast<int32_t>(lroundf(g_smoothed_raw_delta_counts));
+    const int32_t divisor = (g_counts_at_cal > 0) ? g_counts_at_cal : 1;
+    float grams = g_sensor.raw_delta_counts * (static_cast<float>(CAL_REFERENCE_G) / static_cast<float>(divisor));
+    if (grams < 0.0f) {
+      grams = 0.0f;
+    }
+    g_sensor.mass_g = grams;
+
+    g_prev_raw_delta_counts = g_sensor.raw_delta_counts;
     g_prev_mass_g = g_sensor.mass_g;
     g_prev_temp_C = g_sensor.plate_temp_C;
     g_prev_sample_ms = g_sensor.time_ms;
+    g_last_sensor_publish_ms = g_sensor.time_ms;
+    g_sensor.raw_rate_counts_per_min = 0.0f;
     g_sensor.mass_rate_g_per_min = 0.0f;
     g_sensor.temp_rate_C_per_min = 0.0f;
     g_first_sample = false;
   } else {
-    const uint32_t dt_ms = g_sensor.time_ms - g_prev_sample_ms;
-    const float dt_min = static_cast<float>(dt_ms) / 60000.0f;
-    if (dt_min > 0.0001f) {
-      const float mass_rate_raw = (g_sensor.mass_g - g_prev_mass_g) / dt_min;
-      const float temp_rate_raw = (g_sensor.plate_temp_C - g_prev_temp_C) / dt_min;
-      g_sensor.mass_rate_g_per_min =
-          (MASS_RATE_EMA_ALPHA * mass_rate_raw) + ((1.0f - MASS_RATE_EMA_ALPHA) * g_sensor.mass_rate_g_per_min);
-      g_sensor.temp_rate_C_per_min =
-          (TEMP_RATE_EMA_ALPHA * temp_rate_raw) + ((1.0f - TEMP_RATE_EMA_ALPHA) * g_sensor.temp_rate_C_per_min);
+    const uint32_t since_publish_ms = g_sensor.time_ms - g_last_sensor_publish_ms;
+    if (since_publish_ms >= SENSOR_PUBLISH_INTERVAL_MS) {
+      g_sensor.raw_delta_counts = static_cast<int32_t>(lroundf(g_smoothed_raw_delta_counts));
+      g_last_sensor_publish_ms = g_sensor.time_ms;
+
+      const int32_t divisor = (g_counts_at_cal > 0) ? g_counts_at_cal : 1;
+      float grams = g_sensor.raw_delta_counts * (static_cast<float>(CAL_REFERENCE_G) / static_cast<float>(divisor));
+      if (grams < 0.0f) {
+        grams = 0.0f;
+      }
+      g_sensor.mass_g = grams;
+
+      const uint32_t dt_ms = g_sensor.time_ms - g_prev_sample_ms;
+      const float dt_min = static_cast<float>(dt_ms) / 60000.0f;
+      if (dt_min > 0.0001f) {
+        const float raw_rate = (static_cast<float>(g_sensor.raw_delta_counts - g_prev_raw_delta_counts)) / dt_min;
+        const float mass_rate_raw = (g_sensor.mass_g - g_prev_mass_g) / dt_min;
+        const float temp_rate_raw = (g_sensor.plate_temp_C - g_prev_temp_C) / dt_min;
+        g_sensor.raw_rate_counts_per_min =
+            (MASS_RATE_EMA_ALPHA * raw_rate) + ((1.0f - MASS_RATE_EMA_ALPHA) * g_sensor.raw_rate_counts_per_min);
+        g_sensor.mass_rate_g_per_min =
+            (MASS_RATE_EMA_ALPHA * mass_rate_raw) + ((1.0f - MASS_RATE_EMA_ALPHA) * g_sensor.mass_rate_g_per_min);
+        g_sensor.temp_rate_C_per_min =
+            (TEMP_RATE_EMA_ALPHA * temp_rate_raw) + ((1.0f - TEMP_RATE_EMA_ALPHA) * g_sensor.temp_rate_C_per_min);
+      }
+      g_prev_raw_delta_counts = g_sensor.raw_delta_counts;
+      g_prev_mass_g = g_sensor.mass_g;
+      g_prev_temp_C = g_sensor.plate_temp_C;
+      g_prev_sample_ms = g_sensor.time_ms;
     }
-    g_prev_mass_g = g_sensor.mass_g;
-    g_prev_temp_C = g_sensor.plate_temp_C;
-    g_prev_sample_ms = g_sensor.time_ms;
   }
 
   g_sensor.heater_current_on = g_relay_enabled;
@@ -501,18 +536,19 @@ static void updateSensors() {
 }
 
 static void computeDerivedSignals() {
-  g_derived.mass_present = g_sensor.mass_g > MASS_PRESENT_THRESHOLD_G;
-  g_derived.heating_active = g_sensor.plate_temp_C > TEMP_HEATING_THRESHOLD_C;
-  g_derived.mass_stable = fabsf(g_sensor.mass_rate_g_per_min) < STABLE_RATE_THRESHOLD_G_PER_MIN;
-  g_derived.rapid_mass_drop = g_sensor.mass_rate_g_per_min < RAPID_DROP_THRESHOLD_G_PER_MIN;
-  g_derived.drying_detected = g_sensor.mass_rate_g_per_min < DRYING_RATE_THRESHOLD_G_PER_MIN;
-  g_derived.temp_rising = g_sensor.temp_rate_C_per_min > TEMP_RISE_THRESHOLD_C_PER_MIN;
+  g_derived.mass_present = g_sensor.raw_delta_counts > LOAD_PRESENT_THRESHOLD_COUNTS;
+  g_derived.heating_active = g_heating_info || g_sensor.heater_current_on;
+  g_derived.mass_stable = fabsf(g_sensor.raw_rate_counts_per_min) < STABLE_RATE_THRESHOLD_COUNTS_PER_MIN;
+  g_derived.rapid_mass_drop = g_sensor.raw_rate_counts_per_min < RAPID_DROP_THRESHOLD_COUNTS_PER_MIN;
+  g_derived.drying_detected = g_sensor.raw_rate_counts_per_min < DRYING_RATE_THRESHOLD_COUNTS_PER_MIN;
+  g_derived.temp_rising = false;
   g_derived.near_zero_rate_while_hot =
-      g_derived.heating_active && (fabsf(g_sensor.mass_rate_g_per_min) < NEAR_ZERO_RATE_THRESHOLD_G_PER_MIN);
+      g_derived.heating_active &&
+      (fabsf(g_sensor.raw_rate_counts_per_min) < NEAR_ZERO_RATE_THRESHOLD_COUNTS_PER_MIN);
 
   float ratio = 1.0f;
-  if (g_baseline_mass_g > 0.01f) {
-    ratio = g_sensor.mass_g / g_baseline_mass_g;
+  if (g_baseline_load_counts > 0) {
+    ratio = static_cast<float>(g_sensor.raw_delta_counts) / static_cast<float>(g_baseline_load_counts);
   }
   g_derived.dry_condition = ratio < DRY_SHUTDOWN_THRESHOLD;
   g_derived.load_removed_while_hot = (!g_derived.mass_present) && g_derived.heating_active;
@@ -528,14 +564,6 @@ static bool unified_shutdown_trigger(ShutdownReason* reason) {
   }
   if (g_derived.rapid_mass_drop) {
     *reason = ShutdownReason::RapidMassLoss;
-    return true;
-  }
-  if (g_derived.dry_condition) {
-    *reason = ShutdownReason::DryDetected;
-    return true;
-  }
-  if (g_derived.load_removed_while_hot) {
-    *reason = ShutdownReason::VesselRemovedHot;
     return true;
   }
   if (g_derived.warning_timer_expired) {
@@ -555,7 +583,7 @@ static SystemState evaluateTransitions() {
   switch (g_state) {
     case SystemState::IDLE:
       if (g_derived.mass_present) return SystemState::LOAD_DETECTED;
-      if (g_derived.heating_active || g_derived.temp_rising) return SystemState::HEATING_MONITORING;
+      if (g_derived.heating_active) return SystemState::HEATING_MONITORING;
       break;
 
     case SystemState::LOAD_DETECTED:
@@ -565,7 +593,7 @@ static SystemState evaluateTransitions() {
         if (g_load_stable_start_ms == 0) {
           g_load_stable_start_ms = g_sensor.time_ms;
         } else if (g_sensor.time_ms - g_load_stable_start_ms >= STABLE_TIME_MS) {
-          g_baseline_mass_g = g_sensor.mass_g;
+          g_baseline_load_counts = g_sensor.raw_delta_counts;
         }
       } else {
         g_load_stable_start_ms = 0;
@@ -579,14 +607,21 @@ static SystemState evaluateTransitions() {
       break;
 
     case SystemState::EVAPORATING: {
-      const float ratio = (g_baseline_mass_g > 0.01f) ? (g_sensor.mass_g / g_baseline_mass_g) : 1.0f;
+      const float ratio =
+          (g_baseline_load_counts > 0)
+              ? (static_cast<float>(g_sensor.raw_delta_counts) / static_cast<float>(g_baseline_load_counts))
+              : 1.0f;
       if (ratio < DRY_THRESHOLD || g_derived.near_zero_rate_while_hot) return SystemState::WARNING;
       break;
     }
 
     case SystemState::WARNING:
       if (g_serial_ack) return SystemState::HEATING_MONITORING;
-      if (g_sensor.mass_g > (g_baseline_mass_g + MASS_PRESENT_THRESHOLD_G * 0.5f)) return SystemState::HEATING_MONITORING;
+      if (g_baseline_load_counts > 0) {
+        const int32_t resume_threshold = static_cast<int32_t>(
+            static_cast<float>(g_baseline_load_counts) * (1.0f + WARNING_RECOVERY_MARGIN_RATIO));
+        if (g_sensor.raw_delta_counts > resume_threshold) return SystemState::HEATING_MONITORING;
+      }
       break;
 
     case SystemState::PAUSED_BY_USER:
@@ -634,7 +669,7 @@ static void applyStateActions(SystemState new_state) {
     if (g_idle_stable_start_ms == 0) {
       g_idle_stable_start_ms = g_sensor.time_ms;
     } else if (g_sensor.time_ms - g_idle_stable_start_ms >= AUTO_TARE_DWELL_MS) {
-      g_baseline = g_baseline + static_cast<int32_t>(g_sensor.mass_g * (static_cast<float>(g_counts_at_cal) / CAL_REFERENCE_G));
+      g_baseline = g_baseline + g_sensor.raw_delta_counts;
       g_idle_stable_start_ms = g_sensor.time_ms;
       log_event("auto_tare");
     }
@@ -671,12 +706,12 @@ static const char* status_line() {
   switch (g_state) {
     case SystemState::IDLE: return "Ready";
     case SystemState::LOAD_DETECTED: return "Load detected, stabilizing";
-    case SystemState::HEATING_MONITORING: return "Monitoring heat and mass";
+    case SystemState::HEATING_MONITORING: return "Monitoring heat and count rate";
     case SystemState::EVAPORATING: return "Evaporation detected";
-    case SystemState::WARNING: return "Liquid nearly gone - press Enter";
+    case SystemState::WARNING: return "Liquid nearly gone - touch screen";
     case SystemState::SHUTDOWN: return reason_name(g_shutdown_reason);
     case SystemState::PAUSED_BY_USER: return "Load removed - waiting";
-    case SystemState::FAULT: return "Sensor fault - press Enter to reset";
+    case SystemState::FAULT: return "Sensor fault - touch screen to reset";
   }
   return "";
 }
@@ -693,11 +728,11 @@ static void updateUI() {
   snprintf(
       text,
       sizeof(text),
-      "STATE: %s\nHeater: %s\n\nMass: %.2f g\nRate: %.3f g/min\nTemp: %.1f C\n\nStatus: %s",
+      "STATE: %s\nHeater: %s\n\nCounts: %ld\nRate: %.1f counts/min\nTemp: %.1f C\n\nStatus: %s",
       state_name(g_state),
       g_relay_enabled ? "ON" : "OFF",
-      g_sensor.mass_g,
-      g_sensor.mass_rate_g_per_min,
+      static_cast<long>(g_sensor.raw_delta_counts),
+      g_sensor.raw_rate_counts_per_min,
       g_sensor.plate_temp_C,
       status_line());
   lv_label_set_text(g_status_label, text);
@@ -734,17 +769,7 @@ void setup() {
   Serial.print(F(", sck="));
   Serial.println(PIN_HX711_SCK);
 
-  Serial.println(F("[BOOT] waiting for empty-scale Enter"));
-  wait_for_enter(F(">>> Step 1 - Empty scale: remove all weight."));
-  Serial.println(F("[BOOT] baseline collection start"));
-  collect_baseline();
-  Serial.println(F("[BOOT] baseline collection done"));
-
-  Serial.println(F("[BOOT] waiting for calibration Enter"));
-  wait_for_enter(F(">>> Step 2 - Place 250 g calibration weight."));
-  Serial.println(F("[BOOT] calibration collection start"));
-  collect_calibration_250g();
-  Serial.println(F("[BOOT] calibration collection done"));
+  run_first_boot_tare();
 
   g_state_enter_ms = millis();
   log_event("boot_complete");

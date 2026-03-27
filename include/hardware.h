@@ -29,20 +29,21 @@ static constexpr uint8_t RELAY_ACTIVE_LEVEL = 1;
 static constexpr bool USE_DUMMY_TEMPERATURE = true;
 static constexpr float DUMMY_TEMP_C = 95.0f;
 
-// FSM thresholds (starting values from spec).
-static constexpr float MASS_PRESENT_THRESHOLD_G = 20.0f;
-static constexpr float TEMP_HEATING_THRESHOLD_C = 40.0f;
-static constexpr float STABLE_RATE_THRESHOLD_G_PER_MIN = 0.05f;
-static constexpr float RAPID_DROP_THRESHOLD_G_PER_MIN = -50.0f;
-static constexpr float DRYING_RATE_THRESHOLD_G_PER_MIN = -0.2f;
-static constexpr float TEMP_RISE_THRESHOLD_C_PER_MIN = 0.5f;
+// FSM thresholds in raw HX711 units (counts and counts/min).
+static constexpr int32_t LOAD_PRESENT_THRESHOLD_COUNTS = 16000;
+static constexpr float STABLE_RATE_THRESHOLD_COUNTS_PER_MIN = 4000.0f;
+// Sudden-loss trigger in raw HX711 counts/min (primary safety signal).
+static constexpr float RAPID_DROP_THRESHOLD_COUNTS_PER_MIN = -400000.0f;
+static constexpr float DRYING_RATE_THRESHOLD_COUNTS_PER_MIN = -6000.0f;
 
 // Dryness thresholds.
 // WARNING threshold: "nearly gone".
 static constexpr float DRY_THRESHOLD = 0.10f;
 // Hard shutdown dryness threshold (more severe than warning threshold).
 static constexpr float DRY_SHUTDOWN_THRESHOLD = 0.03f;
-static constexpr float NEAR_ZERO_RATE_THRESHOLD_G_PER_MIN = 0.03f;
+static constexpr float NEAR_ZERO_RATE_THRESHOLD_COUNTS_PER_MIN = 2500.0f;
+// Recovery margin in WARNING before resuming (fraction of baseline load).
+static constexpr float WARNING_RECOVERY_MARGIN_RATIO = 0.10f;
 
 // Timing configuration.
 static constexpr uint32_t STABLE_TIME_MS = 15000;
@@ -52,5 +53,7 @@ static constexpr uint32_t AUTO_TARE_DWELL_MS = 30000;
 
 // UI and runtime cadence.
 static constexpr uint32_t UI_UPDATE_MS = 200;
+static constexpr uint32_t SENSOR_PUBLISH_INTERVAL_MS = 1000;
+static constexpr float RAW_COUNTS_EMA_ALPHA = 0.15f;
 static constexpr float MASS_RATE_EMA_ALPHA = 0.35f;
 static constexpr float TEMP_RATE_EMA_ALPHA = 0.35f;
